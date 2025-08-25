@@ -1,14 +1,20 @@
 name: Release mosdns
 
 on:
-  workflow_dispatch: # 将触发器改为手动触发
+  workflow_dispatch:
+    inputs:
+      tag_name: # 新增一个输入字段来获取标签名
+        description: 'The tag for this release (e.g., v1.0.0)'
+        required: true # 标签名是必需的
+        type: string
 
 jobs:
-
   build-release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0 # 确保获取完整的历史以创建标签，如果需要的话
 
       - name: Set up Go
         uses: actions/setup-go@v3
@@ -27,9 +33,20 @@ jobs:
         env:
           CGO_ENABLED: '0'
 
-      - name: Publish
+      - name: Create Git Tag # 新增步骤：创建 Git Tag
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "github-actions@github.com"
+          git tag ${{ github.event.inputs.tag_name }} # 使用输入的标签名创建本地标签
+          git push origin ${{ github.event.inputs.tag_name }} # 推送标签到远程仓库
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 需要 GITHUB_TOKEN 来推送标签
+
+      - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag_name }} # 明确告诉 Release Action 用哪个 Tag
+          name: Release ${{ github.event.inputs.tag_name }} # 可以给 Release 起个名字
           files: './release/mosdns*.zip'
           prerelease: true
         env:
