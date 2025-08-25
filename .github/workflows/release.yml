@@ -1,9 +1,7 @@
 name: Release mosdns
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch: # 将触发器改为手动触发
 
 jobs:
 
