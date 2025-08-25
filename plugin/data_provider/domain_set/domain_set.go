@@ -38,7 +38,6 @@ func init() {
 	coremain.RegNewPluginFunc(PluginType, Init, func() any { return new(Args) })
 }
 
-// 初始化插件
 func Init(bp *coremain.BP, args any) (any, error) {
 	m, err := NewDomainSet(bp, args.(*Args))
 	if err != nil {
@@ -57,7 +56,11 @@ type Args struct {
 var _ data_provider.DomainMatcherProvider = (*DomainSet)(nil)
 
 type DomainSet struct {
-	mg      []domain.Matcher[struct{}]
+	// 优化: 按文件分别维护matcher，支持增量更新
+	fileMatchers map[string]domain.Matcher[struct{}] // key: 文件路径, value: 该文件的matcher
+	setMatchers  []domain.Matcher[struct{}]           // 来自其他plugin提供的matcher
+	expMatcher   domain.Matcher[struct{}]             // 来自args.Exps的matcher
+	
 	watcher *fsnotify.Watcher
 	files   []string
 	mx      sync.RWMutex
@@ -68,31 +71,69 @@ type DomainSet struct {
 func (d *DomainSet) GetDomainMatcher() domain.Matcher[struct{}] {
 	d.mx.RLock()
 	defer d.mx.RUnlock()
-	return MatcherGroup(d.mg)
+	
+	// 优化: 动态合并所有有效的matcher
+	var allMatchers []domain.Matcher[struct{}]
+	
+	// 添加表达式matcher
+	if d.expMatcher != nil {
+		// 使用类型断言来检查Len()方法
+		if lenChecker, ok := d.expMatcher.(interface{ Len() int }); !ok || lenChecker.Len() > 0 {
+			allMatchers = append(allMatchers, d.expMatcher)
+		}
+	}
+	
+	// 添加文件matcher
+	for _, matcher := range d.fileMatchers {
+		if matcher != nil {
+			// 使用类型断言来检查Len()方法
+			if lenChecker, ok := matcher.(interface{ Len() int }); !ok || lenChecker.Len() > 0 {
+				allMatchers = append(allMatchers, matcher)
+			}
+		}
+	}
+	
+	// 添加其他插件的matcher
+	allMatchers = append(allMatchers, d.setMatchers...)
+	
+	return MatcherGroup(allMatchers)
 }
 
 // NewDomainSet inits a DomainSet from given args.
 func NewDomainSet(bp *coremain.BP, args *Args) (*DomainSet, error) {
 	ds := &DomainSet{
-		bp:   bp,
-		args: args,
+		bp:           bp,
+		args:         args,
+		fileMatchers: make(map[string]domain.Matcher[struct{}]), // 初始化文件matcher映射
 	}
 
-	m := domain.NewDomainMixMatcher()
-	if err := LoadExpsAndFiles(args.Exps, args.Files, m); err != nil {
-		return nil, err
-	}
-	if m.Len() > 0 {
-		ds.mg = append(ds.mg, m)
+	// 优化: 分别处理表达式和文件
+	// 1. 处理表达式（args.Exps）
+	if len(args.Exps) > 0 {
+		expMatcher := domain.NewDomainMixMatcher()
+		if err := LoadExps(args.Exps, expMatcher); err != nil {
+			return nil, err
+		}
+		ds.expMatcher = expMatcher
 	}
 
+	// 2. 按文件分别创建matcher
+	for _, file := range args.Files {
+		fileMatcher := domain.NewDomainMixMatcher()
+		if err := LoadFile(file, fileMatcher); err != nil {
+			return nil, fmt.Errorf("failed to load file %s: %w", file, err)
+		}
+		ds.fileMatchers[file] = fileMatcher
+	}
+
+	// 3. 处理其他插件提供的matcher
 	for _, tag := range args.Sets {
 		provider, _ := bp.M().GetPlugin(tag).(data_provider.DomainMatcherProvider)
 		if provider == nil {
 			return nil, fmt.Errorf("%s is not a DomainMatcherProvider", tag)
 		}
 		matcher := provider.GetDomainMatcher()
-		ds.mg = append(ds.mg, matcher)
+		ds.setMatchers = append(ds.setMatchers, matcher)
 	}
 
 	// 如果启用了自动重载且有文件需要监控
@@ -179,10 +220,10 @@ func (d *DomainSet) watchFiles() {
 				return
 			}
 			
-			// 只处理写入和创建事件
+			// 优化: 精确重载变化的文件，而不是所有文件
 			if event.Op&fsnotify.Write == fsnotify.Write || 
 			   event.Op&fsnotify.Create == fsnotify.Create {
-				d.reloadFiles()
+				d.reloadSingleFile(event.Name) // 只重载变化的文件
 			}
 			
 		case err, ok := <-d.watcher.Errors:
@@ -195,35 +236,58 @@ func (d *DomainSet) watchFiles() {
 	}
 }
 
-// reloadFiles 重新加载所有文件
+// reloadSingleFile 优化: 只重新加载指定文件
+func (d *DomainSet) reloadSingleFile(filePath string) {
+	d.mx.Lock()
+	defer d.mx.Unlock()
+	
+	// 检查是否为我们监控的文件
+	if _, exists := d.fileMatchers[filePath]; !exists {
+		return // 不是我们监控的文件，忽略
+	}
+	
+	// 为该文件创建新的matcher
+	newFileMatcher := domain.NewDomainMixMatcher()
+	if err := LoadFile(filePath, newFileMatcher); err != nil {
+		// 加载失败，保持原有状态
+		return
+	}
+	
+	// 原子性更新该文件的matcher
+	d.fileMatchers[filePath] = newFileMatcher
+}
+
+// reloadFiles 重新加载所有文件（保留兼容性）
 func (d *DomainSet) reloadFiles() {
 	d.mx.Lock()
 	defer d.mx.Unlock()
 	
-	// 创建新的matcher
-	newMatchers := make([]domain.Matcher[struct{}], 0, len(d.args.Sets)+1)
-	
-	// 重新加载文件数据
-	m := domain.NewDomainMixMatcher()
-	if err := LoadExpsAndFiles(d.args.Exps, d.args.Files, m); err != nil {
-		return // 静默失败，保持当前状态
+	// 重新加载表达式
+	if len(d.args.Exps) > 0 {
+		expMatcher := domain.NewDomainMixMatcher()
+		if err := LoadExps(d.args.Exps, expMatcher); err == nil {
+			d.expMatcher = expMatcher
+		}
 	}
-	if m.Len() > 0 {
-		newMatchers = append(newMatchers, m)
+	
+	// 重新加载所有文件
+	for _, file := range d.args.Files {
+		fileMatcher := domain.NewDomainMixMatcher()
+		if err := LoadFile(file, fileMatcher); err == nil {
+			d.fileMatchers[file] = fileMatcher
+		}
 	}
 	
 	// 重新添加其他插件提供的matcher
+	newSetMatchers := make([]domain.Matcher[struct{}], 0, len(d.args.Sets))
 	for _, tag := range d.args.Sets {
 		provider, _ := d.bp.M().GetPlugin(tag).(data_provider.DomainMatcherProvider)
-		if provider == nil {
-			continue
+		if provider != nil {
+			matcher := provider.GetDomainMatcher()
+			newSetMatchers = append(newSetMatchers, matcher)
 		}
-		matcher := provider.GetDomainMatcher()
-		newMatchers = append(newMatchers, matcher)
 	}
-	
-	// 原子性更新匹配器列表
-	d.mg = newMatchers
+	d.setMatchers = newSetMatchers
 }
 
 // Close 关闭文件监控器
