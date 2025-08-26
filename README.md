@@ -34,7 +34,7 @@ plugins:
 #### 功能特性
 
 - **三种格式支持**：
-  - `domain`：原始域名格式，如 `example.com`
+  - `domain`：原始域名格式，如 `domain:example.com`
   - `full`：完整格式，如 `full:example.com`
   - `keyword`：关键词格式，如 `keyword:example.com`
 - **高性能缓存**：使用内存缓存避免重复文件读取，支持大文件场景（10万+条目）
