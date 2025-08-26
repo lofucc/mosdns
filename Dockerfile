@@ -10,3 +10,9 @@ FROM alpine:latest
 COPY --from=builder /root/src/mosdns /usr/bin/
 
 RUN apk add --no-cache ca-certificates
+
+# 创建配置目录
+RUN mkdir -p /etc/mosdns
+
+# 设置启动命令
+CMD ["mosdns", "start", "-c", "/etc/mosdns/mosdns.yaml"]
