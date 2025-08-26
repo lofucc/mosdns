@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
@@ -66,6 +67,10 @@ type DomainSet struct {
 	mx      sync.RWMutex
 	bp      *coremain.BP
 	args    *Args
+	
+	// 防抖机制：记录文件的最后修改时间，避免重复加载
+	lastReloadTime map[string]time.Time
+	reloadMutex    sync.Mutex
 }
 
 func (d *DomainSet) GetDomainMatcher() domain.Matcher[struct{}] {
@@ -77,8 +82,9 @@ func (d *DomainSet) GetDomainMatcher() domain.Matcher[struct{}] {
 	
 	// 添加表达式matcher
 	if d.expMatcher != nil {
-		// 使用类型断言来检查Len()方法
-		if lenChecker, ok := d.expMatcher.(interface{ Len() int }); !ok || lenChecker.Len() > 0 {
+		if mixMatcher, ok := d.expMatcher.(*domain.MixMatcher[struct{}]); ok && mixMatcher.Len() > 0 {
+			allMatchers = append(allMatchers, d.expMatcher)
+		} else if mixMatcher == nil {
 			allMatchers = append(allMatchers, d.expMatcher)
 		}
 	}
@@ -86,8 +92,11 @@ func (d *DomainSet) GetDomainMatcher() domain.Matcher[struct{}] {
 	// 添加文件matcher
 	for _, matcher := range d.fileMatchers {
 		if matcher != nil {
-			// 使用类型断言来检查Len()方法
-			if lenChecker, ok := matcher.(interface{ Len() int }); !ok || lenChecker.Len() > 0 {
+			if mixMatcher, ok := matcher.(*domain.MixMatcher[struct{}]); ok {
+				if mixMatcher.Len() > 0 {
+					allMatchers = append(allMatchers, matcher)
+				}
+			} else {
 				allMatchers = append(allMatchers, matcher)
 			}
 		}
@@ -102,9 +111,10 @@ func (d *DomainSet) GetDomainMatcher() domain.Matcher[struct{}] {
 // NewDomainSet inits a DomainSet from given args.
 func NewDomainSet(bp *coremain.BP, args *Args) (*DomainSet, error) {
 	ds := &DomainSet{
-		bp:           bp,
-		args:         args,
-		fileMatchers: make(map[string]domain.Matcher[struct{}]), // 初始化文件matcher映射
+		bp:             bp,
+		args:           args,
+		fileMatchers:   make(map[string]domain.Matcher[struct{}]), // 初始化文件matcher映射
+		lastReloadTime: make(map[string]time.Time),                 // 初始化防抖时间记录
 	}
 
 	// 优化: 分别处理表达式和文件
@@ -205,7 +215,6 @@ func (d *DomainSet) startFileWatcher() error {
 		}
 	}
 	
-	// 启动监控goroutine
 	go d.watchFiles()
 	
 	return nil
@@ -236,13 +245,29 @@ func (d *DomainSet) watchFiles() {
 	}
 }
 
-// reloadSingleFile 优化: 只重新加载指定文件
+// reloadSingleFile 优化: 只重新加载指定文件，带防抖机制
 func (d *DomainSet) reloadSingleFile(filePath string) {
+	// 防抖检查
+	d.reloadMutex.Lock()
+	now := time.Now()
+	lastTime, exists := d.lastReloadTime[filePath]
+	
+	// 如果距离上次重载不到500ms，则跳过
+	debounceInterval := 500 * time.Millisecond
+	if exists && now.Sub(lastTime) < debounceInterval {
+		d.reloadMutex.Unlock()
+		return
+	}
+	
+	// 更新最后重载时间
+	d.lastReloadTime[filePath] = now
+	d.reloadMutex.Unlock()
+	
 	d.mx.Lock()
 	defer d.mx.Unlock()
 	
 	// 检查是否为我们监控的文件
-	if _, exists := d.fileMatchers[filePath]; !exists {
+	if _, monitored := d.fileMatchers[filePath]; !monitored {
 		return // 不是我们监控的文件，忽略
 	}
 	
