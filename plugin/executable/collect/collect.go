@@ -65,13 +65,13 @@ func (c *collect) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	var entry string
 	switch c.format {
 	case "domain":
-		entry = domain
+		entry = fmt.Sprintf("domain:%s", domain)
 	case "full":
 		entry = fmt.Sprintf("full:%s", domain)
 	case "keyword":
 		entry = fmt.Sprintf("keyword:%s", domain)
 	default:
-		entry = domain // 默认为domain格式
+		entry = fmt.Sprintf("full:%s", domain) // 默认为full格式
 	}
 
 	// 检查并写入文件
