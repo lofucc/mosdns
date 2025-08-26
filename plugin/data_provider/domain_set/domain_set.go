@@ -22,6 +22,7 @@ package domain_set
 import (
 	"bytes"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -207,6 +208,7 @@ func (d *DomainSet) startFileWatcher() error {
 		if err := watcher.Add(file); err != nil {
 			return fmt.Errorf("failed to watch file %s: %w", file, err)
 		}
+		log.Printf("[DOMAIN_SET] WATCH %s", file)
 	}
 	
 	go d.watchFiles()
@@ -224,8 +226,12 @@ func (d *DomainSet) watchFiles() {
 			}
 			
 			// 优化: 精确重载变化的文件，而不是所有文件
+			// 增加对Remove和Rename事件的监听，以支持原子文件替换
 			if event.Op&fsnotify.Write == fsnotify.Write || 
-			   event.Op&fsnotify.Create == fsnotify.Create {
+			   event.Op&fsnotify.Create == fsnotify.Create ||
+			   event.Op&fsnotify.Remove == fsnotify.Remove ||
+			   event.Op&fsnotify.Rename == fsnotify.Rename {
+				log.Printf("[DOMAIN_SET] EVENT %s: %v", event.Name, event.Op)
 				d.reloadSingleFile(event.Name) // 只重载变化的文件
 			}
 			
@@ -250,6 +256,7 @@ func (d *DomainSet) reloadSingleFile(filePath string) {
 	debounceInterval := 500 * time.Millisecond
 	if exists && now.Sub(lastTime) < debounceInterval {
 		d.reloadMutex.Unlock()
+		log.Printf("[DOMAIN_SET] SKIP %s (debounced)", filePath)
 		return
 	}
 	
@@ -265,15 +272,25 @@ func (d *DomainSet) reloadSingleFile(filePath string) {
 		return // 不是我们监控的文件，忽略
 	}
 	
+	// 尝试重新添加文件监控（处理原子替换导致的监控失效）
+	if d.watcher != nil {
+		d.watcher.Remove(filePath) // 移除旧的监控
+		if err := d.watcher.Add(filePath); err != nil {
+			log.Printf("[DOMAIN_SET] REWATCH_ERROR %s: %v", filePath, err)
+		}
+	}
+	
 	// 为该文件创建新的matcher
 	newFileMatcher := domain.NewDomainMixMatcher()
 	if err := LoadFile(filePath, newFileMatcher); err != nil {
 		// 加载失败，保持原有状态
+		log.Printf("[DOMAIN_SET] ERROR %s: %v", filePath, err)
 		return
 	}
 	
 	// 原子性更新该文件的matcher
 	d.fileMatchers[filePath] = newFileMatcher
+	log.Printf("[DOMAIN_SET] RELOAD %s", filePath)
 }
 
 // reloadFiles 重新加载所有文件（保留兼容性）
