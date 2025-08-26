@@ -77,32 +77,26 @@ func (d *DomainSet) GetDomainMatcher() domain.Matcher[struct{}] {
 	d.mx.RLock()
 	defer d.mx.RUnlock()
 	
-	// 优化: 动态合并所有有效的matcher
-	var allMatchers []domain.Matcher[struct{}]
-	
-	// 添加表达式matcher
+	// 性能优化：精确预分配容量，避免slice扩容
+	capacity := len(d.fileMatchers) + len(d.setMatchers)
 	if d.expMatcher != nil {
-		if mixMatcher, ok := d.expMatcher.(*domain.MixMatcher[struct{}]); ok && mixMatcher.Len() > 0 {
-			allMatchers = append(allMatchers, d.expMatcher)
-		} else if mixMatcher == nil {
-			allMatchers = append(allMatchers, d.expMatcher)
-		}
+		capacity++
+	}
+	allMatchers := make([]domain.Matcher[struct{}], 0, capacity)
+	
+	// 直接添加表达式matcher，无需检查
+	if d.expMatcher != nil {
+		allMatchers = append(allMatchers, d.expMatcher)
 	}
 	
-	// 添加文件matcher
+	// 直接添加所有非nil的fileMatchers，移除所有类型断言和Len()检查
 	for _, matcher := range d.fileMatchers {
 		if matcher != nil {
-			if mixMatcher, ok := matcher.(*domain.MixMatcher[struct{}]); ok {
-				if mixMatcher.Len() > 0 {
-					allMatchers = append(allMatchers, matcher)
-				}
-			} else {
-				allMatchers = append(allMatchers, matcher)
-			}
+			allMatchers = append(allMatchers, matcher)
 		}
 	}
 	
-	// 添加其他插件的matcher
+	// 批量添加setMatchers
 	allMatchers = append(allMatchers, d.setMatchers...)
 	
 	return MatcherGroup(allMatchers)
