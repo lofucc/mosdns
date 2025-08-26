@@ -226,11 +226,9 @@ func (d *DomainSet) watchFiles() {
 			}
 			
 			// 优化: 精确重载变化的文件，而不是所有文件
-			// 增加对Remove和Rename事件的监听，以支持原子文件替换
+			// 主要监听Write和Create事件，兼容collect插件的直接写入模式
 			if event.Op&fsnotify.Write == fsnotify.Write || 
-			   event.Op&fsnotify.Create == fsnotify.Create ||
-			   event.Op&fsnotify.Remove == fsnotify.Remove ||
-			   event.Op&fsnotify.Rename == fsnotify.Rename {
+			   event.Op&fsnotify.Create == fsnotify.Create {
 				log.Printf("[DOMAIN_SET] EVENT %s: %v", event.Name, event.Op)
 				d.reloadSingleFile(event.Name) // 只重载变化的文件
 			}
@@ -272,13 +270,7 @@ func (d *DomainSet) reloadSingleFile(filePath string) {
 		return // 不是我们监控的文件，忽略
 	}
 	
-	// 尝试重新添加文件监控（处理原子替换导致的监控失效）
-	if d.watcher != nil {
-		d.watcher.Remove(filePath) // 移除旧的监控
-		if err := d.watcher.Add(filePath); err != nil {
-			log.Printf("[DOMAIN_SET] REWATCH_ERROR %s: %v", filePath, err)
-		}
-	}
+	// 直接写入模式下，文件监控不会失效，无需重新添加监控
 	
 	// 为该文件创建新的matcher
 	newFileMatcher := domain.NewDomainMixMatcher()

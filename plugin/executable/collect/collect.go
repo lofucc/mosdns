@@ -371,7 +371,7 @@ func (c *collect) batchAppendToFile(entries []string) {
 	}
 }
 
-// 重写文件，排除删除的条目
+// 重写文件，排除删除的条目（使用直接写入模式）
 func (c *collect) rewriteFileWithDeletes(toDelete map[string]bool) error {
 	// 读取现有文件
 	file, err := os.Open(c.filePath)
@@ -399,28 +399,20 @@ func (c *collect) rewriteFileWithDeletes(toDelete map[string]bool) error {
 		return err
 	}
 
-	// 写入临时文件
-	tmpFile := c.filePath + ".tmp"
-	f, err := os.Create(tmpFile)
+	// 直接重写文件（触发fsnotify.Write事件）
+	f, err := os.OpenFile(c.filePath, os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 
 	for _, line := range validLines {
 		if _, err := f.WriteString(line + "\n"); err != nil {
-			f.Close()
-			os.Remove(tmpFile)
 			return err
 		}
 	}
 
-	if err := f.Close(); err != nil {
-		os.Remove(tmpFile)
-		return err
-	}
-
-	// 原子替换
-	return os.Rename(tmpFile, c.filePath)
+	return nil
 }
 
 func (c *collect) loadFileToCache() error {
