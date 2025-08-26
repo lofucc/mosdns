@@ -208,7 +208,7 @@ func (d *DomainSet) startFileWatcher() error {
 		if err := watcher.Add(file); err != nil {
 			return fmt.Errorf("failed to watch file %s: %w", file, err)
 		}
-		log.Printf("[DOMAIN_SET] WATCH %s", file)
+		// log.Printf("[DOMAIN_SET] WATCH %s", file)
 	}
 	
 	go d.watchFiles()
@@ -229,7 +229,7 @@ func (d *DomainSet) watchFiles() {
 			// 主要监听Write和Create事件，兼容collect插件的直接写入模式
 			if event.Op&fsnotify.Write == fsnotify.Write || 
 			   event.Op&fsnotify.Create == fsnotify.Create {
-				log.Printf("[DOMAIN_SET] EVENT %s: %v", event.Name, event.Op)
+				// log.Printf("[DOMAIN_SET] EVENT %s: %v", event.Name, event.Op)
 				d.reloadSingleFile(event.Name) // 只重载变化的文件
 			}
 			
@@ -254,7 +254,7 @@ func (d *DomainSet) reloadSingleFile(filePath string) {
 	debounceInterval := 500 * time.Millisecond
 	if exists && now.Sub(lastTime) < debounceInterval {
 		d.reloadMutex.Unlock()
-		log.Printf("[DOMAIN_SET] SKIP %s (debounced)", filePath)
+		// log.Printf("[DOMAIN_SET] SKIP %s (debounced)", filePath)
 		return
 	}
 	
@@ -269,20 +269,19 @@ func (d *DomainSet) reloadSingleFile(filePath string) {
 	if _, monitored := d.fileMatchers[filePath]; !monitored {
 		return // 不是我们监控的文件，忽略
 	}
-	
-	// 直接写入模式下，文件监控不会失效，无需重新添加监控
-	
+		
 	// 为该文件创建新的matcher
 	newFileMatcher := domain.NewDomainMixMatcher()
 	if err := LoadFile(filePath, newFileMatcher); err != nil {
 		// 加载失败，保持原有状态
+		// 保留错误日志以便问题排查
 		log.Printf("[DOMAIN_SET] ERROR %s: %v", filePath, err)
 		return
 	}
 	
 	// 原子性更新该文件的matcher
 	d.fileMatchers[filePath] = newFileMatcher
-	log.Printf("[DOMAIN_SET] RELOAD %s", filePath)
+	// log.Printf("[DOMAIN_SET] RELOAD %s", filePath)
 }
 
 // reloadFiles 重新加载所有文件（保留兼容性）

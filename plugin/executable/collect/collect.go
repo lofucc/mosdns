@@ -1,22 +1,3 @@
-/*
- * Copyright (C) 2020-2022, IrineSistiana
- *
- * This file is part of mosdns.
- *
- * mosdns is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * mosdns is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
-
 package collect
 
 import (
@@ -47,39 +28,34 @@ func init() {
 }
 
 type Args struct {
-	Format      string `yaml:"format"`       // domain, full, keyword
-	FilePath    string `yaml:"file_path"`    // 文件路径
-	Operation   string `yaml:"operation"`    // add(默认), delete
-	FlushPeriod int    `yaml:"flush_period"` // 文件刷新间隔(秒)，默认60秒
+	Format    string `yaml:"format"`    // domain, full, keyword
+	FilePath  string `yaml:"file_path"` // 文件路径
+	Operation string `yaml:"operation"` // add(默认), delete
 }
 
 var _ sequence.Executable = (*collectWrapper)(nil)
 
-type FileOperation struct {
-	Type  string // "add" or "delete"
-	Entry string
+// 写入操作类型
+type writeOp struct {
+	action string // "add" 或 "rewrite"
+	entry  string // 单条记录（add时使用）
 }
 
+// collect结构
 type collect struct {
 	filePath string
 	
-	// 统一锁机制
-	cacheMu sync.RWMutex // 缓存读写锁，保护内存操作
-	fileMu  sync.Mutex   // 文件操作锁，保护所有文件IO
+	// 锁机制
+	cacheMu sync.RWMutex // 保护内存缓存
+	fileMu  sync.Mutex   // 保护文件操作的原子性
 	
 	// 数据结构
-	cache   map[string]bool // 主缓存
-	deleted map[string]bool // 待删除标记
+	cache map[string]bool // 内存缓存，启动时加载文件内容
 	
-	// 统一的文件操作队列
-	fileOpQueue chan FileOperation // 统一的文件操作队列
-	flushTicker *time.Ticker        // 定期刷新
-	stopChan    chan struct{}       // 停止信号
-	wg          sync.WaitGroup      // 等待goroutine结束
-	
-	// 批量操作缓冲
-	pendingAdds    []string // 待追加的条目
-	pendingDeletes map[string]bool // 待删除的条目
+	// 异步写入
+	writeQueue chan writeOp   // 统一的写入队列
+	stopChan   chan struct{} // 停止信号
+	wg         sync.WaitGroup
 	
 	// 引用计数
 	refCount int32
@@ -110,14 +86,14 @@ func (cw *collectWrapper) Exec(ctx context.Context, qCtx *query_context.Context)
 	case "keyword":
 		entry = fmt.Sprintf("keyword:%s", domain)
 	default:
-		entry = fmt.Sprintf("full:%s", domain) // 默认为full格式
+		entry = fmt.Sprintf("full:%s", domain)
 	}
 
 	// 根据操作类型执行相应操作
 	switch cw.operation {
 	case "delete":
 		return cw.instance.deleteEntry(entry)
-	default: // "add" 或其他值都当作添加
+	default:
 		return cw.instance.addEntry(entry)
 	}
 }
@@ -125,107 +101,108 @@ func (cw *collectWrapper) Exec(ctx context.Context, qCtx *query_context.Context)
 // 添加条目
 func (c *collect) addEntry(entry string) error {
 	c.cacheMu.Lock()
-	defer c.cacheMu.Unlock()
-
-	// 检查是否已存在于缓存中（未被删除标记）
-	if c.cache[entry] && !c.deleted[entry] {
-		return nil // 已存在且未被删除标记，无需添加
-	}
-
-	// 如果在删除队列中，取消删除操作
-	if c.deleted[entry] {
-		delete(c.deleted, entry)
-		delete(c.pendingDeletes, entry)
-		c.cache[entry] = true
-		log.Printf("[COLLECT] CANCEL_DEL %s", entry)
-		return nil // 取消删除，不需要重复写入文件
-	}
-
-	// 新条目，添加到缓存
-	c.cache[entry] = true
-
-	// 通知文件操作队列（非阻塞）
-	select {
-	case c.fileOpQueue <- FileOperation{Type: "add", Entry: entry}:
-	default:
-		// 队列满时，添加到待处理列表，等待下次批量处理
-		c.pendingAdds = append(c.pendingAdds, entry)
+	// 检查是否已存在于内存缓存中
+	if c.cache[entry] {
+		c.cacheMu.Unlock()
+		return nil // 已存在，无需重复添加
 	}
 	
-	log.Printf("[COLLECT] ADD %s", entry)
+	// 添加到内存缓存
+	c.cache[entry] = true
+	c.cacheMu.Unlock()
+	
+	// 异步追加到文件，带重试机制
+	go func() {
+		for retries := 0; retries < 3; retries++ {
+			select {
+			case c.writeQueue <- writeOp{action: "add", entry: entry}:
+				return // 成功发送
+			default:
+				if retries < 2 {
+					// 等待一小段时间后重试
+					time.Sleep(time.Millisecond * 10)
+					continue
+				}
+				// 最后一次重试失败，保留错误日志
+				log.Printf("[COLLECT] ERROR: failed to queue add operation after 3 retries for %s", entry)
+			}
+		}
+	}()
+	
+	// log.Printf("[COLLECT] ADD %s to %s", entry, c.filePath)
 	return nil
 }
 
-// 删除条目
+// 删除条目 
 func (c *collect) deleteEntry(entry string) error {
 	c.cacheMu.Lock()
-	defer c.cacheMu.Unlock()
-
-	// 检查条目是否存在且未被标记删除
-	if !c.cache[entry] || c.deleted[entry] {
-		return nil // 不存在或已标记删除，无需重复操作
+	// 检查条目是否存在
+	if !c.cache[entry] {
+		c.cacheMu.Unlock()
+		return nil // 不存在，无需删除
 	}
-
-	// 立即更新内存状态：保留在cache中但标记为deleted
-	// 这样addEntry可以检测到并取消删除操作
-	c.deleted[entry] = true
-	c.pendingDeletes[entry] = true
-
-	// 通知文件操作队列（非阻塞）
-	select {
-	case c.fileOpQueue <- FileOperation{Type: "delete", Entry: entry}:
-	default:
-		// 队列满时跳过，等待下次定期刷新处理
-	}
-
-	log.Printf("[COLLECT] DEL %s", entry)
+	
+	// 从内存缓存中删除
+	delete(c.cache, entry)
+	c.cacheMu.Unlock()
+	
+	// 异步触发文件重写，带重试机制
+	go func() {
+		for retries := 0; retries < 5; retries++ { // delete操作更重要，多重试几次
+			select {
+			case c.writeQueue <- writeOp{action: "rewrite"}:
+				return // 成功发送
+			default:
+				if retries < 4 {
+					// 等待更长时间后重试
+					time.Sleep(time.Millisecond * 50)
+					continue
+				}
+				// 最后一次重试失败，保留错误日志
+				log.Printf("[COLLECT] ERROR: failed to queue rewrite operation after 5 retries")
+			}
+		}
+	}()
+	
+	// log.Printf("[COLLECT] DEL %s for %s", entry, c.filePath)
 	return nil
 }
 
-// 统一的文件操作处理器
-func (c *collect) fileOperationProcessor() {
+// 简化的写入处理器
+func (c *collect) writeProcessor() {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
 		
 		for {
 			select {
-			case op := <-c.fileOpQueue:
-				c.handleFileOperation(op)
-			case <-c.flushTicker.C:
-				c.batchFlush()
+			case op := <-c.writeQueue:
+				c.handleWriteOperation(op)
 			case <-c.stopChan:
 				// 处理剩余操作
 				for {
 					select {
-					case op := <-c.fileOpQueue:
-						c.handleFileOperation(op)
+					case op := <-c.writeQueue:
+						c.handleWriteOperation(op)
 					default:
-						goto exit
+						return
 					}
 				}
-				exit:
-				c.batchFlush() // 最后一次刷新
-				return
 			}
 		}
 	}()
 }
 
-// 处理单个文件操作
-func (c *collect) handleFileOperation(op FileOperation) {
+// 简化的写入操作处理
+func (c *collect) handleWriteOperation(op writeOp) {
 	c.fileMu.Lock()
 	defer c.fileMu.Unlock()
 
-	switch op.Type {
+	switch op.action {
 	case "add":
-		c.appendToFile(op.Entry)
-	case "delete":
-		// 删除操作暂存，等待批量处理
-		c.cacheMu.Lock()
-		c.pendingDeletes[op.Entry] = true
-		c.cacheMu.Unlock()
-		log.Printf("[COLLECT] DELETE_QUEUED %s", op.Entry)
+		c.appendToFile(op.entry)
+	case "rewrite":
+		c.rewriteEntireFile()
 	}
 }
 
@@ -233,19 +210,25 @@ func (c *collect) handleFileOperation(op FileOperation) {
 func (c *collect) appendToFile(entry string) {
 	file, err := os.OpenFile(c.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		return // 静默处理错误
+		// 保留错误日志
+		log.Printf("[COLLECT] ERROR: failed to open file for append: %v", err)
+		return
 	}
 	defer file.Close()
-	file.WriteString(entry + "\n")
+	
+	if _, err := file.WriteString(entry + "\n"); err != nil {
+		// 保留错误日志
+		log.Printf("[COLLECT] ERROR: failed to append entry: %v", err)
+	}
 }
 
 // 启动后台处理goroutine
 func (c *collect) startBackgroundProcessor() {
-	c.fileOperationProcessor()
+	c.writeProcessor()
 }
 
 // 获取或创建文件实例
-func getOrCreateInstance(filePath string, flushPeriod int) (*collect, error) {
+func getOrCreateInstance(filePath string) (*collect, error) {
 	instancesMu.Lock()
 	defer instancesMu.Unlock()
 	
@@ -257,27 +240,20 @@ func getOrCreateInstance(filePath string, flushPeriod int) (*collect, error) {
 	}
 	
 	// 创建新实例
-	if flushPeriod <= 0 {
-		flushPeriod = 60
-	}
-	
 	instance = &collect{
-		filePath:       filePath,
-		fileOpQueue:    make(chan FileOperation, 1000),
-		stopChan:       make(chan struct{}),
-		flushTicker:    time.NewTicker(time.Duration(flushPeriod) * time.Second),
-		pendingDeletes: make(map[string]bool),
-		refCount:       1,
+		filePath:   filePath,
+		writeQueue: make(chan writeOp, 1000), // 增大缓冲队列
+		stopChan:   make(chan struct{}),
+		refCount:   1,
 	}
 	
-	// 立即加载文件到内存
+	// 初始化内存缓存并加载文件内容
 	instance.cache = make(map[string]bool)
-	instance.deleted = make(map[string]bool)
 	if err := instance.loadFileToCache(); err != nil {
 		return nil, fmt.Errorf("failed to load file to cache: %w", err)
 	}
 	
-	// 启动后台处理
+	// 启动后台写入处理
 	instance.startBackgroundProcessor()
 	
 	// 注册到全局管理器
@@ -305,114 +281,50 @@ func (c *collect) close() error {
 	if c.stopChan != nil {
 		close(c.stopChan)
 	}
-	if c.flushTicker != nil {
-		c.flushTicker.Stop()
-	}
 	c.wg.Wait()
 	return nil
 }
 
-// 批量刷新操作
-func (c *collect) batchFlush() {
-	c.fileMu.Lock()
-	defer c.fileMu.Unlock()
-	
-	c.cacheMu.Lock()
-	
-	// 处理待追加的条目
-	if len(c.pendingAdds) > 0 {
-		c.batchAppendToFile(c.pendingAdds)
-		c.pendingAdds = c.pendingAdds[:0] // 清空
+// 重写整个文件 - 根据内存缓存重建文件
+func (c *collect) rewriteEntireFile() {
+	c.cacheMu.RLock()
+	// 复制当前缓存状态
+	var entries []string
+	for entry := range c.cache {
+		entries = append(entries, entry)
 	}
+	c.cacheMu.RUnlock()
 	
-	// 检查是否有删除操作需要处理
-	if len(c.pendingDeletes) == 0 {
-		c.cacheMu.Unlock()
+	// 使用临时文件+原子性重命名，确保触发fsnotify事件
+	tempFilePath := c.filePath + ".tmp"
+	tempFile, err := os.OpenFile(tempFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		// 保留错误日志
+		log.Printf("[COLLECT] ERROR: failed to create temp file: %v", err)
 		return
 	}
 	
-	// 复制待删除列表
-	toDelete := make(map[string]bool)
-	for k := range c.pendingDeletes {
-		toDelete[k] = true
-	}
-	c.cacheMu.Unlock()
-
-	// 执行文件重写
-	log.Printf("[COLLECT] REWRITE_FILE start, deleting %d entries", len(toDelete))
-	err := c.rewriteFileWithDeletes(toDelete)
-	if err != nil {
-		log.Printf("[COLLECT] REWRITE_FILE failed: %v", err)
-		return // 出错时保留删除标记，下次再试
-	}
-
-	// 清理删除标记和缓存
-	c.cacheMu.Lock()
-	for k := range toDelete {
-		delete(c.deleted, k)
-		delete(c.pendingDeletes, k)
-		delete(c.cache, k) // 从缓存中完全移除
-		log.Printf("[COLLECT] DELETE_DONE %s", k)
-	}
-	c.cacheMu.Unlock()
-	log.Printf("[COLLECT] REWRITE_FILE completed, %d entries deleted", len(toDelete))
-}
-
-// 批量追加到文件
-func (c *collect) batchAppendToFile(entries []string) {
-	file, err := os.OpenFile(c.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return // 静默处理错误
-	}
-	defer file.Close()
-	
+	// 写入所有条目到临时文件
 	for _, entry := range entries {
-		file.WriteString(entry + "\n")
-	}
-}
-
-// 重写文件，排除删除的条目（使用直接写入模式）
-func (c *collect) rewriteFileWithDeletes(toDelete map[string]bool) error {
-	// 读取现有文件
-	file, err := os.Open(c.filePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // 文件不存在，无需处理
-		}
-		return err
-	}
-
-	var validLines []string
-	scanner := bufio.NewScanner(file)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" && !toDelete[line] {
-			validLines = append(validLines, line)
+		if _, err := tempFile.WriteString(entry + "\n"); err != nil {
+			tempFile.Close()
+			os.Remove(tempFilePath)
+			// 保留错误日志
+			log.Printf("[COLLECT] ERROR: failed to write entry to temp file: %v", err)
+			return
 		}
 	}
-	file.Close()
-
-	if err := scanner.Err(); err != nil {
-		return err
+	tempFile.Close()
+	
+	// 原子性重命名，这会触发fsnotify的WRITE事件
+	if err := os.Rename(tempFilePath, c.filePath); err != nil {
+		os.Remove(tempFilePath)
+		// 保留错误日志
+		log.Printf("[COLLECT] ERROR: failed to rename temp file: %v", err)
+		return
 	}
-
-	// 直接重写文件（触发fsnotify.Write事件）
-	f, err := os.OpenFile(c.filePath, os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	for _, line := range validLines {
-		if _, err := f.WriteString(line + "\n"); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	
+	// log.Printf("[COLLECT] REWRITE_FILE completed, %d entries written", len(entries))
 }
 
 func (c *collect) loadFileToCache() error {
@@ -448,16 +360,16 @@ func Init(_ *coremain.BP, args any) (any, error) {
 
 	format := strings.ToLower(a.Format)
 	if format != "domain" && format != "full" && format != "keyword" {
-		format = "full" // 默认值
+		format = "full"
 	}
 
 	operation := strings.ToLower(a.Operation)
 	if operation != "add" && operation != "delete" {
-		operation = "add" // 默认值
+		operation = "add"
 	}
 
 	// 获取或创建共享实例
-	instance, err := getOrCreateInstance(a.FilePath, a.FlushPeriod)
+	instance, err := getOrCreateInstance(a.FilePath)
 	if err != nil {
 		return nil, err
 	}

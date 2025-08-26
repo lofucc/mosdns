@@ -29,31 +29,33 @@ plugins:
 
 ### collect
 
-域名收集插件，用于收集DNS查询中的域名并保存到文件，支持去重和高性能缓存。
+域名收集插件，用于收集和管理DNS查询中的域名，支持添加和删除操作，具有高性能缓存机制。
 
-#### 功能特性
+#### 核心特性
 
-- **三种格式支持**：
-  - `domain`：原始域名格式，如 `domain:example.com`
-  - `full`：完整格式，如 `full:example.com`
-  - `keyword`：关键词格式，如 `keyword:example.com`
-- **高性能缓存**：使用内存缓存避免重复文件读取，支持大文件场景（10万+条目）
-- **自动去重**：检测已存在的域名条目，避免重复写入
-- **并发安全**：使用读写锁确保多线程安全
-- **追加写入**：新条目追加到文件末尾，不影响现有内容
+- **双向操作**：支持域名的添加和删除操作
+- **三种格式**：
+  - `domain`：域名格式 `domain:example.com`
+  - `full`：完整格式 `full:example.com` 
+  - `keyword`：关键词格式 `keyword:example.com`
+- **高性能架构**：
+  - 启动时加载文件内容到内存缓存
+  - 添加操作：内存检查去重 + 异步追加写入
+  - 删除操作：内存立即删除 + 异步文件重写
+- **数据一致性**：
+  - 多实例共享机制，同文件只有一个实例
+  - 异步写入队列，容量1000，带重试机制
+  - 临时文件+原子重命名，确保文件操作安全
+- **自动热加载**：配合 `domain_set` 插件实现文件变化自动重载
 
-#### 配置方式
+#### 配置参数
 
-**完整配置（推荐）：**
 ```yaml
 plugins:
   - tag: domain_collector
     type: collect
     args:
-      format: full                           # domain, full, keyword
-      file_path: /path/to/collected_domains.txt
-      
-# 在规则中使用
-rules:
-  - exec: $domain_collector
+      format: full                    # 域名格式：domain/full/keyword，默认full
+      file_path: /path/to/domains.txt # 文件路径（必填）
+      operation: add                  # 操作类型：add/delete，默认add
 ```
