@@ -1,20 +1,16 @@
-FROM --platform=${TARGETPLATFORM} golang:latest as builder
-
+FROM golang:latest as builder
 ARG CGO_ENABLED=0
 
 COPY ./ /root/src/
 WORKDIR /root/src/
 RUN go build -ldflags "-s -w -X main.version=$(git describe --tags --long --always)" -trimpath -o mosdns
 
+FROM gcr.io/distroless/static-debian12:latest
 
-FROM --platform=${TARGETPLATFORM} alpine:latest
-
-COPY --from=builder /root/src/mosdns /usr/bin/
-
-RUN apk add --no-cache ca-certificates
+COPY --from=builder /root/src/mosdns /usr/bin/mosdns
 
 # 创建配置目录
 RUN mkdir -p /etc/mosdns
 
 # 设置启动命令
-CMD ["mosdns", "start", "-c", "/etc/mosdns/mosdns.yaml"]
+ENTRYPOINT ["mosdns", "start", "-c", "/etc/mosdns/mosdns.yaml"]
