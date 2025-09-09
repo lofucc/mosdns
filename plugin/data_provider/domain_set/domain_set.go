@@ -62,6 +62,7 @@ type DomainSet struct {
 	expMatcher   domain.Matcher[struct{}]
 	
 	cachedMatcher atomic.Value
+	rebuilding    int32  // 标记是否正在重建，原子操作
 	
 	watcher *fsnotify.Watcher
 	files   []string
@@ -78,7 +79,17 @@ func (d *DomainSet) GetDomainMatcher() domain.Matcher[struct{}] {
 		return cached.(MatcherGroup)
 	}
 	
-	d.rebuildCache()
+	// 使用原子操作避免多个协程同时重建
+	if atomic.CompareAndSwapInt32(&d.rebuilding, 0, 1) {
+		// 只有一个协程能进入重建
+		d.rebuildCache()
+		atomic.StoreInt32(&d.rebuilding, 0)
+	} else {
+		// 其他协程等待重建完成，最多等待10ms
+		for i := 0; i < 100 && atomic.LoadInt32(&d.rebuilding) == 1; i++ {
+			time.Sleep(100 * time.Microsecond)
+		}
+	}
 	
 	if cached := d.cachedMatcher.Load(); cached != nil {
 		return cached.(MatcherGroup)
@@ -245,6 +256,7 @@ func (d *DomainSet) watchFiles() {
 }
 
 func (d *DomainSet) reloadSingleFile(filePath string) {
+	// 防抖检查
 	d.reloadMutex.Lock()
 	now := time.Now()
 	lastTime, exists := d.lastReloadTime[filePath]
@@ -258,20 +270,19 @@ func (d *DomainSet) reloadSingleFile(filePath string) {
 	d.lastReloadTime[filePath] = now
 	d.reloadMutex.Unlock()
 	
-	d.mx.Lock()
-	defer d.mx.Unlock()
-	
-	if _, monitored := d.fileMatchers[filePath]; !monitored {
-		return
-	}
-		
+	// 先在锁外创建新的matcher，减少锁持有时间
 	newFileMatcher := domain.NewDomainMixMatcher()
 	if err := LoadFile(filePath, newFileMatcher); err != nil {
 		return
 	}
 	
-	d.fileMatchers[filePath] = newFileMatcher
-	d.rebuildCacheUnsafe()
+	// 快速更新
+	d.mx.Lock()
+	if _, monitored := d.fileMatchers[filePath]; monitored {
+		d.fileMatchers[filePath] = newFileMatcher
+		d.rebuildCacheUnsafe()
+	}
+	d.mx.Unlock()
 }
 
 func (d *DomainSet) reloadFiles() {
