@@ -22,8 +22,6 @@ package domain_set
 import (
 	"bytes"
 	"fmt"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
@@ -57,135 +55,96 @@ type Args struct {
 var _ data_provider.DomainMatcherProvider = (*DomainSet)(nil)
 
 type DomainSet struct {
-	fileMatchers map[string]domain.Matcher[struct{}]
-	setMatchers  []domain.Matcher[struct{}]
-	expMatcher   domain.Matcher[struct{}]
+	// 动态matcher组，支持热重载
+	dynamicGroup *DynamicMatcherGroup
 	
-	// 预分配的MatcherGroup，避免运行时分配
-	primaryGroup   MatcherGroup
-	secondaryGroup MatcherGroup
-	currentPrimary int32  // 0或1，指示当前使用哪个group
-	
+	// 可选的热加载支持
 	watcher *fsnotify.Watcher
 	files   []string
-	mx      sync.RWMutex
-	bp      *coremain.BP
-	args    *Args
 	
-	// 简化文件重载，移除复杂的防抖机制
-	lastReloadTime map[string]time.Time
-	reloadMutex    sync.Mutex
+	// 重建参数
+	bp   *coremain.BP
+	args *Args
 }
 
 func (d *DomainSet) GetDomainMatcher() domain.Matcher[struct{}] {
-	// 直接返回当前激活的预分配group，无需atomic.Value
-	if atomic.LoadInt32(&d.currentPrimary) == 0 {
-		return d.primaryGroup
-	}
-	return d.secondaryGroup
+	// 返回动态matcher组，支持热重载
+	fmt.Printf("[domain_set] GetDomainMatcher调用，返回动态matcher组\n")
+	return d.dynamicGroup
 }
 
-func (d *DomainSet) rebuildCache() {
-	d.mx.RLock()
-	defer d.mx.RUnlock()
-	d.rebuildCacheUnsafe()
-}
-
-func (d *DomainSet) rebuildCacheUnsafe() {
-	// 确定要更新的是哪个group（双缓冲）
-	currentPrimary := atomic.LoadInt32(&d.currentPrimary)
-	var targetGroup *MatcherGroup
+// rebuildMatcher 重建matcher（简化版）
+func (d *DomainSet) rebuildMatcher() error {
+	fmt.Printf("[domain_set] 开始重建domain matcher\n")
 	
-	if currentPrimary == 0 {
-		targetGroup = &d.secondaryGroup
-	} else {
-		targetGroup = &d.primaryGroup
-	}
+	var matchers []domain.Matcher[struct{}]
 	
-	// 重用现有slice，避免重新分配
-	*targetGroup = (*targetGroup)[:0] // 清空但保持容量
-	
-	// 预分配足够容量
-	capacity := len(d.fileMatchers) + len(d.setMatchers)
-	if d.expMatcher != nil {
-		capacity++
-	}
-	if cap(*targetGroup) < capacity {
-		*targetGroup = make(MatcherGroup, 0, capacity)
-	}
-	
-	if d.expMatcher != nil {
-		*targetGroup = append(*targetGroup, d.expMatcher)
-	}
-	
-	for _, matcher := range d.fileMatchers {
-		if matcher != nil {
-			*targetGroup = append(*targetGroup, matcher)
+	// 加载表达式和文件到单个MixMatcher
+	if len(d.args.Exps) > 0 || len(d.args.Files) > 0 {
+		m := domain.NewDomainMixMatcher()
+		if err := LoadExpsAndFiles(d.args.Exps, d.args.Files, m); err != nil {
+			fmt.Printf("[domain_set] 加载表达式和文件失败: %v\n", err)
+			return err
+		}
+		if m.Len() > 0 {
+			matchers = append(matchers, m)
+			fmt.Printf("[domain_set] 成功加载表达式和文件: exps=%d, files=%d, domains=%d\n", 
+				len(d.args.Exps), len(d.args.Files), m.Len())
 		}
 	}
 	
-	*targetGroup = append(*targetGroup, d.setMatchers...)
-	
-	// 原子切换到新的group
-	if currentPrimary == 0 {
-		atomic.StoreInt32(&d.currentPrimary, 1)
-	} else {
-		atomic.StoreInt32(&d.currentPrimary, 0)
+	// 添加其他插件的matchers
+	for _, tag := range d.args.Sets {
+		provider, _ := d.bp.M().GetPlugin(tag).(data_provider.DomainMatcherProvider)
+		if provider == nil {
+			fmt.Printf("[domain_set] 找不到domain matcher provider: %s\n", tag)
+			return fmt.Errorf("%s is not a DomainMatcherProvider", tag)
+		}
+		matcher := provider.GetDomainMatcher()
+		matchers = append(matchers, matcher)
+		fmt.Printf("[domain_set] 成功添加插件matcher: %s\n", tag)
 	}
+	
+	// 更新动态matcher组
+	newGroup := MatcherGroup(matchers)
+	d.dynamicGroup.Update(newGroup)
+	
+	fmt.Printf("[domain_set] domain matcher重建完成，总计%d个matchers\n", len(matchers))
+	
+	// 打印每个matcher的详细信息
+	for i, matcher := range matchers {
+		fmt.Printf("[domain_set] matcher[%d]: %T\n", i, matcher)
+	}
+	
+	return nil
 }
 
 func NewDomainSet(bp *coremain.BP, args *Args) (*DomainSet, error) {
-	// 预估容量
-	estimatedCapacity := len(args.Files) + len(args.Sets)
-	if len(args.Exps) > 0 {
-		estimatedCapacity++
+	ds := &DomainSet{
+		bp:           bp,
+		args:         args,
+		dynamicGroup: NewDynamicMatcherGroup(),
 	}
 	
-	ds := &DomainSet{
-		bp:             bp,
-		args:           args,
-		fileMatchers:   make(map[string]domain.Matcher[struct{}]),
-		lastReloadTime: make(map[string]time.Time),
-		// 预分配两个MatcherGroup，避免运行时分配
-		primaryGroup:   make(MatcherGroup, 0, estimatedCapacity),
-		secondaryGroup: make(MatcherGroup, 0, estimatedCapacity),
-		currentPrimary: 0,
+	// 构建初始matcher
+	if err := ds.rebuildMatcher(); err != nil {
+		return nil, err
 	}
-
-	if len(args.Exps) > 0 {
-		expMatcher := domain.NewDomainMixMatcher()
-		if err := LoadExps(args.Exps, expMatcher); err != nil {
-			return nil, err
-		}
-		ds.expMatcher = expMatcher
-	}
-
-	for _, file := range args.Files {
-		fileMatcher := domain.NewDomainMixMatcher()
-		if err := LoadFile(file, fileMatcher); err != nil {
-			return nil, fmt.Errorf("failed to load file %s: %w", file, err)
-		}
-		ds.fileMatchers[file] = fileMatcher
-	}
-
-	for _, tag := range args.Sets {
-		provider, _ := bp.M().GetPlugin(tag).(data_provider.DomainMatcherProvider)
-		if provider == nil {
-			return nil, fmt.Errorf("%s is not a DomainMatcherProvider", tag)
-		}
-		matcher := provider.GetDomainMatcher()
-		ds.setMatchers = append(ds.setMatchers, matcher)
-	}
-
-	ds.rebuildCache()
-
+	
+	// 可选的文件监控
 	if args.AutoReload && len(args.Files) > 0 {
+		fmt.Printf("[domain_set] 启用文件热重载功能，监控文件: %v\n", args.Files)
 		ds.files = args.Files
 		if err := ds.startFileWatcher(); err != nil {
+			fmt.Printf("[domain_set] 启动文件监控失败: %v\n", err)
 			return nil, fmt.Errorf("failed to start file watcher: %w", err)
 		}
+		fmt.Printf("[domain_set] 文件监控启动成功\n")
+	} else {
+		fmt.Printf("[domain_set] 文件热重载功能未启用 (auto_reload=%v, files_count=%d)\n", 
+			args.AutoReload, len(args.Files))
 	}
-
+	
 	return ds, nil
 }
 
@@ -243,6 +202,7 @@ func (d *DomainSet) startFileWatcher() error {
 		if err := watcher.Add(file); err != nil {
 			return fmt.Errorf("failed to watch file %s: %w", file, err)
 		}
+		fmt.Printf("[domain_set] 开始监控文件: %s\n", file)
 	}
 	
 	go d.watchFiles()
@@ -251,87 +211,72 @@ func (d *DomainSet) startFileWatcher() error {
 }
 
 func (d *DomainSet) watchFiles() {
+	lastReload := time.Now()
+	
+	fmt.Printf("[domain_set] 文件监控循环开始\n")
+	
 	for {
 		select {
 		case event, ok := <-d.watcher.Events:
 			if !ok {
+				fmt.Printf("[domain_set] 文件监控事件channel已关闭，退出监控循环\n")
 				return
 			}
 			
+			fmt.Printf("[domain_set] 收到文件事件: %s, 操作: %s\n", event.Name, event.Op.String())
+			
 			if event.Op&fsnotify.Write == fsnotify.Write || 
 			   event.Op&fsnotify.Create == fsnotify.Create {
-				d.reloadSingleFile(event.Name)
+				
+				// 检查是否是监控的文件
+				monitored := false
+				for _, file := range d.files {
+					if file == event.Name {
+						monitored = true
+						break
+					}
+				}
+				
+				if !monitored {
+					fmt.Printf("[domain_set] 忽略非监控文件的事件: %s\n", event.Name)
+					continue
+				}
+				
+				// 简单防抖
+				if time.Since(lastReload) < 500*time.Millisecond {
+					fmt.Printf("[domain_set] 防抖期内，跳过重载: %s\n", event.Name)
+					continue
+				}
+				
+				fmt.Printf("[domain_set] 检测到文件变更，开始热重载: %s\n", event.Name)
+				
+				// 异步重载，不阻塞
+				go func(filename string) {
+					start := time.Now()
+					if err := d.rebuildMatcher(); err != nil {
+						fmt.Printf("[domain_set] 热重载失败 (%s): %v\n", filename, err)
+					} else {
+						fmt.Printf("[domain_set] 热重载完成 (%s): 耗时 %v\n", filename, time.Since(start))
+					}
+				}(event.Name)
+				
+				lastReload = time.Now()
 			}
 			
 		case err, ok := <-d.watcher.Errors:
 			if !ok {
+				fmt.Printf("[domain_set] 文件监控错误channel已关闭，退出监控循环\n")
 				return
 			}
-			_ = err
+			fmt.Printf("[domain_set] 文件监控错误: %v\n", err)
 		}
 	}
 }
 
-func (d *DomainSet) reloadSingleFile(filePath string) {
-	// 简化防抖，减少map操作
-	d.reloadMutex.Lock()
-	now := time.Now()
-	lastTime, exists := d.lastReloadTime[filePath]
-	
-	if exists && now.Sub(lastTime) < 500*time.Millisecond {
-		d.reloadMutex.Unlock()
-		return
-	}
-	
-	d.lastReloadTime[filePath] = now
-	d.reloadMutex.Unlock()
-	
-	// 先在锁外加载文件，减少锁持有时间
-	newFileMatcher := domain.NewDomainMixMatcher()
-	if err := LoadFile(filePath, newFileMatcher); err != nil {
-		return
-	}
-	
-	// 原子性更新
-	d.mx.Lock()
-	if _, monitored := d.fileMatchers[filePath]; monitored {
-		d.fileMatchers[filePath] = newFileMatcher
-		d.rebuildCacheUnsafe()
-	}
-	d.mx.Unlock()
-}
-
-func (d *DomainSet) reloadFiles() {
-	d.mx.Lock()
-	defer d.mx.Unlock()
-	
-	if len(d.args.Exps) > 0 {
-		expMatcher := domain.NewDomainMixMatcher()
-		if err := LoadExps(d.args.Exps, expMatcher); err == nil {
-			d.expMatcher = expMatcher
-		}
-	}
-	
-	for _, file := range d.args.Files {
-		fileMatcher := domain.NewDomainMixMatcher()
-		if err := LoadFile(file, fileMatcher); err == nil {
-			d.fileMatchers[file] = fileMatcher
-		}
-	}
-	
-	newSetMatchers := make([]domain.Matcher[struct{}], 0, len(d.args.Sets))
-	for _, tag := range d.args.Sets {
-		provider, _ := d.bp.M().GetPlugin(tag).(data_provider.DomainMatcherProvider)
-		if provider != nil {
-			matcher := provider.GetDomainMatcher()
-			newSetMatchers = append(newSetMatchers, matcher)
-		}
-	}
-	d.setMatchers = newSetMatchers
-}
 
 func (d *DomainSet) Close() error {
 	if d.watcher != nil {
+		fmt.Printf("[domain_set] 关闭文件监控器\n")
 		return d.watcher.Close()
 	}
 	return nil

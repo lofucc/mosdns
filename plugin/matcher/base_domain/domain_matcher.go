@@ -41,42 +41,30 @@ type Args struct {
 type MatchFunc func(qCtx *query_context.Context, m domain.Matcher[struct{}]) (bool, error)
 
 type Matcher struct {
-	match     MatchFunc
-	mg        []domain.Matcher[struct{}]
-	providers []data_provider.DomainMatcherProvider
-	bq        sequence.BQ
+	match MatchFunc
+	mg    []domain.Matcher[struct{}]  // 预构建的matcher列表
 }
 
 func (m *Matcher) Match(_ context.Context, qCtx *query_context.Context) (bool, error) {
-	// 预分配切片避免多次扩容
-	dynamicMatchers := make([]domain.Matcher[struct{}], 0, len(m.providers)+len(m.mg))
-	
-	// 从providers获取最新的matchers
-	for _, provider := range m.providers {
-		dm := provider.GetDomainMatcher()
-		dynamicMatchers = append(dynamicMatchers, dm)
-	}
-	
-	// 添加静态的匿名matchers
-	dynamicMatchers = append(dynamicMatchers, m.mg...)
-	
-	return m.match(qCtx, domain_set.MatcherGroup(dynamicMatchers))
+	// 直接使用预构建的matcher列表，高性能
+	return m.match(qCtx, domain_set.MatcherGroup(m.mg))
 }
 
 func NewMatcher(bq sequence.BQ, args *Args, f MatchFunc) (m *Matcher, err error) {
 	m = &Matcher{
 		match: f,
-		bq:    bq,
 	}
 
-	// 存储providers以便动态获取最新的matchers
+	// 在初始化时获取matchers并保存
 	for _, tag := range args.DomainSets {
 		p := bq.M().GetPlugin(tag)
 		dsProvider, _ := p.(data_provider.DomainMatcherProvider)
 		if dsProvider == nil {
 			return nil, fmt.Errorf("cannot find domain set %s", tag)
 		}
-		m.providers = append(m.providers, dsProvider)
+		dm := dsProvider.GetDomainMatcher()
+		m.mg = append(m.mg, dm)
+		fmt.Printf("[domain_matcher] 获取并保存matcher: %s\n", tag)
 	}
 
 	// Anonymous set from plugin's args and files.
