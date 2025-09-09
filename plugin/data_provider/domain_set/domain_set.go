@@ -61,8 +61,10 @@ type DomainSet struct {
 	setMatchers  []domain.Matcher[struct{}]
 	expMatcher   domain.Matcher[struct{}]
 	
-	cachedMatcher atomic.Value
-	rebuilding    int32  // 标记是否正在重建，原子操作
+	// 预分配的MatcherGroup，避免运行时分配
+	primaryGroup   MatcherGroup
+	secondaryGroup MatcherGroup
+	currentPrimary int32  // 0或1，指示当前使用哪个group
 	
 	watcher *fsnotify.Watcher
 	files   []string
@@ -70,32 +72,17 @@ type DomainSet struct {
 	bp      *coremain.BP
 	args    *Args
 	
+	// 简化文件重载，移除复杂的防抖机制
 	lastReloadTime map[string]time.Time
 	reloadMutex    sync.Mutex
 }
 
 func (d *DomainSet) GetDomainMatcher() domain.Matcher[struct{}] {
-	if cached := d.cachedMatcher.Load(); cached != nil {
-		return cached.(MatcherGroup)
+	// 直接返回当前激活的预分配group，无需atomic.Value
+	if atomic.LoadInt32(&d.currentPrimary) == 0 {
+		return d.primaryGroup
 	}
-	
-	// 使用原子操作避免多个协程同时重建
-	if atomic.CompareAndSwapInt32(&d.rebuilding, 0, 1) {
-		// 只有一个协程能进入重建
-		d.rebuildCache()
-		atomic.StoreInt32(&d.rebuilding, 0)
-	} else {
-		// 其他协程等待重建完成，最多等待10ms
-		for i := 0; i < 100 && atomic.LoadInt32(&d.rebuilding) == 1; i++ {
-			time.Sleep(100 * time.Microsecond)
-		}
-	}
-	
-	if cached := d.cachedMatcher.Load(); cached != nil {
-		return cached.(MatcherGroup)
-	}
-	
-	return MatcherGroup{}
+	return d.secondaryGroup
 }
 
 func (d *DomainSet) rebuildCache() {
@@ -105,34 +92,64 @@ func (d *DomainSet) rebuildCache() {
 }
 
 func (d *DomainSet) rebuildCacheUnsafe() {
+	// 确定要更新的是哪个group（双缓冲）
+	currentPrimary := atomic.LoadInt32(&d.currentPrimary)
+	var targetGroup *MatcherGroup
+	
+	if currentPrimary == 0 {
+		targetGroup = &d.secondaryGroup
+	} else {
+		targetGroup = &d.primaryGroup
+	}
+	
+	// 重用现有slice，避免重新分配
+	*targetGroup = (*targetGroup)[:0] // 清空但保持容量
+	
+	// 预分配足够容量
 	capacity := len(d.fileMatchers) + len(d.setMatchers)
 	if d.expMatcher != nil {
 		capacity++
 	}
-	allMatchers := make([]domain.Matcher[struct{}], 0, capacity)
+	if cap(*targetGroup) < capacity {
+		*targetGroup = make(MatcherGroup, 0, capacity)
+	}
 	
 	if d.expMatcher != nil {
-		allMatchers = append(allMatchers, d.expMatcher)
+		*targetGroup = append(*targetGroup, d.expMatcher)
 	}
 	
 	for _, matcher := range d.fileMatchers {
 		if matcher != nil {
-			allMatchers = append(allMatchers, matcher)
+			*targetGroup = append(*targetGroup, matcher)
 		}
 	}
 	
-	allMatchers = append(allMatchers, d.setMatchers...)
+	*targetGroup = append(*targetGroup, d.setMatchers...)
 	
-	newMatcherGroup := MatcherGroup(allMatchers)
-	d.cachedMatcher.Store(newMatcherGroup)
+	// 原子切换到新的group
+	if currentPrimary == 0 {
+		atomic.StoreInt32(&d.currentPrimary, 1)
+	} else {
+		atomic.StoreInt32(&d.currentPrimary, 0)
+	}
 }
 
 func NewDomainSet(bp *coremain.BP, args *Args) (*DomainSet, error) {
+	// 预估容量
+	estimatedCapacity := len(args.Files) + len(args.Sets)
+	if len(args.Exps) > 0 {
+		estimatedCapacity++
+	}
+	
 	ds := &DomainSet{
 		bp:             bp,
 		args:           args,
 		fileMatchers:   make(map[string]domain.Matcher[struct{}]),
 		lastReloadTime: make(map[string]time.Time),
+		// 预分配两个MatcherGroup，避免运行时分配
+		primaryGroup:   make(MatcherGroup, 0, estimatedCapacity),
+		secondaryGroup: make(MatcherGroup, 0, estimatedCapacity),
+		currentPrimary: 0,
 	}
 
 	if len(args.Exps) > 0 {
@@ -256,13 +273,12 @@ func (d *DomainSet) watchFiles() {
 }
 
 func (d *DomainSet) reloadSingleFile(filePath string) {
-	// 防抖检查
+	// 简化防抖，减少map操作
 	d.reloadMutex.Lock()
 	now := time.Now()
 	lastTime, exists := d.lastReloadTime[filePath]
 	
-	debounceInterval := 500 * time.Millisecond
-	if exists && now.Sub(lastTime) < debounceInterval {
+	if exists && now.Sub(lastTime) < 500*time.Millisecond {
 		d.reloadMutex.Unlock()
 		return
 	}
@@ -270,13 +286,13 @@ func (d *DomainSet) reloadSingleFile(filePath string) {
 	d.lastReloadTime[filePath] = now
 	d.reloadMutex.Unlock()
 	
-	// 先在锁外创建新的matcher，减少锁持有时间
+	// 先在锁外加载文件，减少锁持有时间
 	newFileMatcher := domain.NewDomainMixMatcher()
 	if err := LoadFile(filePath, newFileMatcher); err != nil {
 		return
 	}
 	
-	// 快速更新
+	// 原子性更新
 	d.mx.Lock()
 	if _, monitored := d.fileMatchers[filePath]; monitored {
 		d.fileMatchers[filePath] = newFileMatcher
